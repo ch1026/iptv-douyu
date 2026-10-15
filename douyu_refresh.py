@@ -36,6 +36,14 @@
                  由中转服务在每次请求时【重新签发】一条新直链并 302 过去。
                  这是目前唯一能彻底解决「直链一次性、播放器测速后播放失败」的方案，
                  见同目录 douyu-worker.js 与说明文档。
+  --relay-rooms  可选，逗号分隔的房间号。这些房间改走 "${worker-base}/r/<房间号>"
+                 流式中继，中转服务会顺带做 FLV 时间戳归一化。
+                 用于「上游流时间戳损坏」的房间：这类流的 AVC 配置帧带着一个过期
+                 时间基准（实测 蓝翔新三国 rid=5908256 的配置帧 ts=16690、首个图像帧
+                 ts=327583370，相差 91 小时），播放器时间轴崩溃，表现是
+                 「频道加载得出来但播不出」。走 /r/ 后时间戳被重排成 0/40/80…，可正常起播。
+                 脚本每次运行都会自动探测并打印哪些房间有此问题。
+                 代价：该房间流量过一遍中转服务，首屏比 302 模式略慢，所以只按需开。
   --no-verify 跳过真流校验。默认会抓 FLV 头实测分辨率，因为斗鱼档位名存在虚标
               （实测有标注 1080P、实际只推 720P 的房间）
   --referer   写入斗鱼线路的 Referer，默认 https://www.douyu.com/。
@@ -172,21 +180,26 @@ def probe_referer(urls, tries: int = 5) -> str:
 
 
 def flv_resolution(url: str, timeout: int = 20, referer=None):
-    """实抓 FLV 流的 onMetaData，返回真实 (宽, 高, 视频码率kbps)。
+    """实抓 FLV 头，返回真实 (宽, 高, 视频码率kbps, 时间戳异常ms)。
 
     必要性：斗鱼返回的档位名存在虚标（实测有标注 1080P、实际只推 720P 的房间），
     只信档位名会把低清源混进结果，所以这里做一次真流校验。
+
+    第 4 个返回值是「时间戳损坏量」：斗鱼部分转码流的 AVC sequence header 带着
+    一个过期时间基准（实测 蓝翔新三国 的 config 帧 ts=16690、首个图像帧 ts=327583370，
+    相差 91 小时），播放器时间轴会崩，表现是「加载得出来但播不出」。
+    正常流该值为 0；返回值明显偏离 0 就说明这条流需要走中转的时间戳归一化。
     """
-    h = {"User-Agent": "Lavf/58.76.100"}
+    hdr_in = {"User-Agent": "Lavf/58.76.100"}
     if referer:
-        h["Referer"] = referer
+        hdr_in["Referer"] = referer
     if _COOKIE:
-        h["Cookie"] = _COOKIE
+        hdr_in["Cookie"] = _COOKIE
     try:
-        resp = http(url, headers=h, timeout=timeout)
+        resp = http(url, headers=hdr_in, timeout=timeout)
         data = resp.read(260000)
     except Exception:  # noqa: BLE001
-        return 0, 0, 0
+        return 0, 0, 0, 0
 
     def num_after(tag: bytes):
         i = data.find(tag)
@@ -198,9 +211,39 @@ def flv_resolution(url: str, timeout: int = 20, referer=None):
         return None
 
     w = num_after(b"width")
-    h = num_after(b"height")
+    ht = num_after(b"height")
     vk = num_after(b"videodatarate")
-    return (int(w) if w else 0, int(h) if h else 0, int(vk) if vk else 0)
+
+    # 顺带扫一遍 tag，算 config 帧与首个图像帧的时间戳差
+    ts_gap = 0
+    try:
+        pos = 13  # FLV header(9) + prevTagSize0(4)
+        cfg_ts = None
+        while pos + 15 <= len(data):
+            ttype = data[pos]
+            dsize = int.from_bytes(data[pos + 1:pos + 4], "big")
+            ts = int.from_bytes(data[pos + 4:pos + 7], "big") | (data[pos + 7] << 24)
+            total = 11 + dsize + 4
+            if pos + total > len(data):
+                break
+            if ttype == 9 and dsize >= 2:
+                is_cfg = (data[pos + 11] >> 4) == 1 and data[pos + 12] == 0
+                if is_cfg:
+                    if cfg_ts is None:
+                        cfg_ts = ts
+                else:
+                    if cfg_ts is None:
+                        cfg_ts = ts          # 流里没有 config 帧，以首帧为基准
+                    else:
+                        gap = ts - cfg_ts
+                        if gap < 0 or gap > 5000:
+                            ts_gap = gap
+                        break
+            pos += total
+    except Exception:  # noqa: BLE001
+        pass
+
+    return (int(w) if w else 0, int(ht) if ht else 0, int(vk) if vk else 0, ts_gap)
 
 
 class Douyu:
@@ -357,6 +400,12 @@ def main():
     ap.add_argument("--worker-base", default="",
                     help="中转服务地址，填了则输出 ${worker-base}/d/<房间号>，"
                          "由中转服务每次请求重新签发直链（推荐，见 douyu-worker.js）")
+    ap.add_argument("--relay-rooms", default="",
+                    help="走【流式中继】而非 302 的房间号，逗号分隔，例如 5908256。"
+                         "用于斗鱼转码流时间戳损坏的房间（config 帧与首个图像帧差 91 小时，"
+                         "播放器加载得出来但播不出）。中继会顺带把时间戳归一化修好；"
+                         "代价是流量过一遍中转服务、首屏略慢，所以只给确有需要的房间开。"
+                         "仅在配合 --worker-base 时生效。")
     ap.add_argument("--cdn", default="hw-h5", help="斗鱼 CDN 参数，默认 hw-h5")
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 个房间（调试用）")
     ap.add_argument("--workers", type=int, default=3,
@@ -484,27 +533,52 @@ def main():
             # 斗鱼对高频请求会概率性返回空流（实测：6 并发出数据的约占 76%，
             # 低频请求为 100%），所以探测失败时降速重试一次，避免误判。
             _rid, r = item
-            w, h, bit = flv_resolution(r["url"], referer=ref_url)
+            w, h, bit, gap = flv_resolution(r["url"], referer=ref_url)
             if not w:
                 time.sleep(1.2)
-                w, h, bit = flv_resolution(r["url"], referer=ref_url)
-            return w, h, bit
+                w, h, bit, gap = flv_resolution(r["url"], referer=ref_url)
+            return w, h, bit, gap
 
-        verified, false_label = [], 0
+        verified, false_label, ts_bad = [], 0, []
         with cf.ThreadPoolExecutor(max_workers=args.workers) as ex:
-            for (rid, r), (w, h, bit) in zip(ok, ex.map(check_one, ok)):
+            for (rid, r), (w, h, bit, gap) in zip(ok, ex.map(check_one, ok)):
                 if w and w < floor_of(rid):
                     false_label += 1
                     bad = dict(r)
                     bad["verified"] = "档位名 %s 虚标，实测 %dx%d" % (
                         r.get("rate_name") or "?", w, h)
                     low.append((rid, bad))
-                else:
-                    good = dict(r)
-                    good["verified"] = ("实测 %dx%d %dkbps" % (w, h, bit)) if w else "未校验成功（探测超时）"
-                    verified.append((rid, good))
+                    continue
+                good = dict(r)
+                good["verified"] = ("实测 %dx%d %dkbps" % (w, h, bit)) if w else "未校验成功（探测超时）"
+                if gap:
+                    # 时间戳损坏：直链形式在多数播放器上无法起播，
+                    # 必须走中转的 /r/ 通道做归一化（见 douyu-worker.js）
+                    good["ts_gap"] = gap
+                    ts_bad.append((rid, gap))
+                verified.append((rid, good))
         ok = verified
         print("  校验后达标: %d 条 | 拦截虚标: %d 条" % (len(ok), false_label))
+        if ts_bad:
+            # 严重：配置帧时间基准与真实媒体帧差了 1 小时以上 ——
+            # 以配置帧建立时间轴的播放器会直接崩掉（「加载出来但播不出」）
+            hard = [(r, g) for r, g in ts_bad if abs(g) > 3600000]
+            soft = [(r, g) for r, g in ts_bad if abs(g) <= 3600000]
+            print("  ⚠️ 时间戳异常 %d 条（配置帧与首个媒体帧不在同一时间基准上）:"
+                  % len(ts_bad))
+            if hard:
+                print("     严重 %d 条（偏差 > 1 小时，多数播放器无法起播，建议加进 --relay-rooms）:"
+                      % len(hard))
+                for rid, gap in sorted(hard, key=lambda x: -abs(x[1])):
+                    nm = next((x["name"] for x in rooms if x["rid"] == rid), rid)
+                    print("       %-24s rid=%-9s %6.1f 小时" % (nm[:24], rid, gap / 3600000.0))
+            if soft:
+                print("     轻微 %d 条（秒级偏差，多数播放器可播，但可能拖慢起播）:" % len(soft))
+                for rid, gap in sorted(soft, key=lambda x: -abs(x[1]))[:6]:
+                    nm = next((x["name"] for x in rooms if x["rid"] == rid), rid)
+                    print("       %-24s rid=%-9s %6.1f 秒" % (nm[:24], rid, gap / 1000.0))
+                if len(soft) > 6:
+                    print("       ... 另有 %d 条" % (len(soft) - 6))
 
     print("-" * 78)
     print("原画达标 : %d" % len(ok))
@@ -525,11 +599,20 @@ def main():
     stamp = time.strftime("%Y-%m-%d %H:%M:%S",
                           time.gmtime(time.time() + 8 * 3600)) + " (UTC+8)"
     use_worker = bool(args.worker_base)
+    relay_set = set(x.strip() for x in (args.relay_rooms or "").replace(";", ",")
+                    .replace(" ", ",").split(",") if x.strip())
 
     def out_url(rid, r):
         """最终写进 m3u 的线路地址。填了 --worker-base 就指向中转服务，
-        由它每次重新签发新直链 —— 这是绕开「直链一次性」的唯一办法。"""
-        return "%s/d/%s" % (wbase, rid) if use_worker else r["url"]
+        由它每次重新签发新直链 —— 这是绕开「直链一次性」的唯一办法。
+
+        位于 --relay-rooms 里的房间走 /r/（流式中继 + FLV 时间戳归一化），
+        用来修复斗鱼部分转码流的时间戳损坏：这类流的 config 帧时间戳与
+        首个图像帧差了 91 小时，播放器时间轴崩溃，表现是「加载出来但播不出」。"""
+        if not use_worker:
+            return r["url"]
+        mode = "r" if rid in relay_set else "d"
+        return "%s/%s/%s" % (wbase, mode, rid)
 
     # 走中转服务时，播放器只跟中转服务打交道，Referer 由中转服务自己补，
     # 所以不必再往 m3u 里写 #EXTVLCOPT:http-referrer。
@@ -539,6 +622,10 @@ def main():
            "# 生成时间: %s" % stamp]
     if use_worker:
         out.append("# 线路由中转服务 %s 动态签发直链（每次请求都是新的 token）" % wbase)
+        if relay_set:
+            out.append("# 其中 %s 走流式中继模式，并已做 FLV 时间戳归一化"
+                       "（这些房间上游流时间戳损坏，直链形式在多数播放器上无法起播）"
+                       % ",".join(sorted(relay_set)))
     else:
         out.append("# ⚠️ 直链为「一次性授权」：同一地址只能成功拉流一次，"
                    "播放器若先测速再播放、或播放中断线重连，都会失败。")
@@ -550,7 +637,7 @@ def main():
              "# ⚠️ 斗鱼直链为一次性授权且需要 Referer 请求头，本格式无法携带请求头，"
              "建议优先使用 m3u 输出或中转服务"]
     report = [("频道名", "房间号", "状态", "档位名", "流类型", "宽度", "高度",
-               "码率kbps", "实测", "直链")]
+               "码率kbps", "实测", "时间戳", "直链")]
     written = set()
     seen_local = set()
     good_map = {rid: r for rid, r in ok}
@@ -564,7 +651,7 @@ def main():
             src = results.get(rid) or {}
             reason = src.get("verified") or src.get("rate_name") or str(src.get("error") or "未取流")
             report.append((name, rid, "额外-剔除" if room.get("extra") else "剔除",
-                           reason, "", 0, 0, 0, "", ""))
+                           reason, "", 0, 0, 0, "", "", ""))
             continue
         if room["extinf"]:
             out.append(room["extinf"])
@@ -572,13 +659,22 @@ def main():
             out.append("#EXTINF:-1 group-title=\"斗鱼补充\",%s" % name)
         if hdr:
             out.append(hdr)
+        # 时间戳损坏的房间：直链形式在多数播放器上「加载得出来但播不出」，
+        # 走中转 /r/ 通道（FLV 时间戳归一化）才能修好。
+        gap = r.get("ts_gap") or 0
+        if gap and not (use_worker and rid in relay_set):
+            out.append("# ⚠️ 本房间上游流时间戳损坏（配置帧跳变 %.1f 小时），"
+                       "多数播放器会加载后无法起播；部署中转服务并加 "
+                       "--relay-rooms %s 可修复" % (gap / 3600000.0, rid))
         out.append(out_url(rid, r))
         written.add(rid)
         kind = ("转码%sk" % r["transcoded_bit"]) if r.get("transcoded") else "原画"
         report.append((name, rid,
                        "额外OK" if room.get("extra") else "OK",
                        r["rate_name"], kind, r["width"], r["height"], r["bit"],
-                       r.get("verified", ""), out_url(rid, r)))
+                       r.get("verified", ""),
+                       ("⚠️ 跳变 %.1f 小时" % (gap / 3600000.0)) if gap else "正常",
+                       out_url(rid, r)))
         if name not in seen_local:
             seen_local.add(name)
             local.append("%s,%s" % (name, out_url(rid, r)))
@@ -609,6 +705,9 @@ def main():
                 merged.append("# 注意：斗鱼直链是「一次性授权」——同一地址只能成功拉流一次。")
                 merged.append("#      播放器先测速再播放、或播放中重连，都会失败。"
                               "要彻底解决请用 --worker-base 中转。")
+                merged.append("#      另有部分房间的上游流时间戳损坏（配置帧与首个媒体帧"
+                              "不在同一时间基准），会「加载得出来但播不出」，"
+                              "需用 --relay-rooms 走中转修复；具体是哪些见下方逐条标注。")
                 if hdr:
                     merged.append("# 斗鱼线路需要 Referer，已在每条斗鱼线路前写入 %s" % hdr)
                 noted = True
@@ -623,6 +722,11 @@ def main():
             if not r:
                 merged.append(ln)
                 continue
+            gap = r.get("ts_gap") or 0
+            if gap and not (use_worker and rid in relay_set):
+                merged.append("# ⚠️ 本线上游流时间戳损坏（配置帧跳变 %.1f 小时），"
+                              "多数播放器会加载后无法起播；部署中转服务并加 "
+                              "--relay-rooms %s 可修复" % (gap / 3600000.0, rid))
             if hdr:
                 merged.append(hdr)
             merged.append(out_url(rid, r))
@@ -637,6 +741,11 @@ def main():
             for rid, room in extra_ok:
                 r = good_map[rid]
                 merged.append("#EXTINF:-1 group-title=\"斗鱼补充\",%s" % room["name"])
+                gap = r.get("ts_gap") or 0
+                if gap and not (use_worker and rid in relay_set):
+                    merged.append("# ⚠️ 本线上游流时间戳损坏（配置帧跳变 %.1f 小时），"
+                                  "多数播放器会加载后无法起播；部署中转服务并加 "
+                                  "--relay-rooms %s 可修复" % (gap / 3600000.0, rid))
                 if hdr:
                     merged.append(hdr)
                 merged.append(out_url(rid, r))
