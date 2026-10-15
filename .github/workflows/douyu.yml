@@ -12,6 +12,26 @@
 #     https://<你的用户名>.github.io/<本仓库名>/full.m3u
 #   仅斗鱼频道：
 #     https://<你的用户名>.github.io/<本仓库名>/douyu.m3u
+#
+# ---------------------------------------------------------------------------
+# 三个可选设置（都在仓库 Settings → Secrets and variables → Actions 里加）
+#
+#   Variables（普通变量）DOUYU_WORKER_BASE
+#       填你部署好的中转服务地址，例如 https://douyu.xxx.workers.dev
+#       填了之后输出的线路会走中转服务，每次请求都重新签发新直链 ——
+#       这是唯一能彻底解决「直链一次性、播放器测速后播放失败」的办法。
+#       不填（或删掉）则退回直链模式，行为与现在完全一样。
+#       中转服务代码见同目录 douyu-worker.js。
+#
+#   Secrets（加密）DOUYU_COOKIE
+#       填你自己的斗鱼登录 Cookie。带上后，多档位房间有机会拿到真原画；
+#       不带的话斗鱼会把多档位房间降级成 _4000 转码流（一起看类房间更会压到 _550。
+#       注意：Cookie 等同账号凭证，只放在自己仓库里，别外传。
+#
+#   Variables DOUYU_EXTRA_ROOMS
+#       额外收录的房间（主仓库因画质门槛过滤掉的），格式 "房间号=频道名,房间号=频道名"
+#       留空则使用下面的默认值。
+# ---------------------------------------------------------------------------
 
 name: douyu-m3u
 
@@ -32,6 +52,14 @@ concurrency:
   group: douyu-m3u
   cancel-in-progress: false
 
+env:
+  # 主订阅源。换成你自己的也行。
+  SRC_M3U: https://ch1026.github.io/iptv-api/result.m3u
+  # 额外收录的房间：这些在主仓库里因为实测画质低于门槛被过滤掉了，这里手动加回。
+  # 「一起看」类房间斗鱼侧本来就只给 550kbps（蓝翔新三国实测 640x360），
+  # 嫌画质低把这几个删掉即可。
+  EXTRA_ROOMS: ${{ vars.DOUYU_EXTRA_ROOMS || '5908256=蓝翔新三国,7459925=蓝翔老三国,12253936=新三国(颜老师)' }}
+
 jobs:
   refresh:
     runs-on: ubuntu-latest
@@ -50,16 +78,23 @@ jobs:
       # 线上保留上一次的好结果，不会被空文件覆盖。
       #
       # --merge 产出【完整合并版】full.m3u：主结果里的非斗鱼线路原样保留、
-      # 斗鱼线路换成原画直链。它可以直接替代主订阅地址，这样斗鱼源的时效
-      # 由本任务（每 10 分钟）保证，主仓库无需做任何改动、也不用配白名单。
+      # 斗鱼线路换成原画直链，同时保留上游转流线作为备用。
+      # 它可以直接替代主订阅地址，主仓库无需做任何改动、也不用配白名单。
+      #
+      # DOUYU_WORKER_BASE 未配置时为空串，脚本会自动退回「直链模式」。
       - name: 生成斗鱼原画源
+        env:
+          DOUYU_COOKIE: ${{ secrets.DOUYU_COOKIE }}
         run: |
           python douyu_refresh.py \
-            --src "https://ch1026.github.io/iptv-api/result.m3u" \
+            --src "$SRC_M3U" \
             --out  public/douyu.m3u \
             --merge public/full.m3u \
             --local public/douyu-local.txt \
-            --report public/douyu-report.csv
+            --report public/douyu-report.csv \
+            --extra-rooms "$EXTRA_ROOMS" \
+            --worker-base "${{ vars.DOUYU_WORKER_BASE }}" \
+            --cookie "$DOUYU_COOKIE"
 
       - name: 生成索引页
         run: |
@@ -67,17 +102,24 @@ jobs:
           <!doctype html><meta charset="utf-8">
           <title>斗鱼原画源</title>
           <style>body{font:15px/1.9 system-ui,sans-serif;max-width:760px;margin:40px auto;padding:0 20px}
-          code{background:#f4f4f4;padding:2px 6px;border-radius:4px}h3{margin-bottom:4px}</style>
+          code{background:#f4f4f4;padding:2px 6px;border-radius:4px}h3{margin-bottom:4px}
+          .warn{background:#fff8e1;border-left:4px solid #f0ad4e;padding:10px 14px;border-radius:4px}</style>
           <h2>斗鱼原画源</h2>
-          <p>由 GitHub Actions 每 10 分钟自动刷新，直链带签名，约 20~30 分钟过期，请勿手动另存。</p>
+          <p>由 GitHub Actions 每 10 分钟自动刷新。直链带签名，约 20~30 分钟过期，请勿手动另存。</p>
+          <div class="warn">
+            <b>注意：斗鱼直链是「一次性授权」。</b>同一条地址只能成功拉流一次，
+            播放器若先测速再播放、或播放中断线重连，都会失败（表现为「播一两秒就报失败」）。
+            彻底解决请部署中转服务（<code>douyu-worker.js</code>），并在仓库变量里设置
+            <code>DOUYU_WORKER_BASE</code>。
+          </div>
           <h3>推荐：完整合并版</h3>
-          <p><code>full.m3u</code> —— 主结果的全部频道 + 斗鱼线路已换成原画直链。
-          可直接替代原来的主订阅地址。</p>
+          <p><code>full.m3u</code> —— 主结果的全部频道 + 斗鱼线路已换成原画直链，
+          并保留上游转流线作为备用。可直接替代原来的主订阅地址。</p>
           <h3>其它文件</h3>
           <ul>
             <li><code>douyu.m3u</code> —— 只含斗鱼频道，适合与原订阅并行使用</li>
             <li><code>douyu-local.txt</code> —— iptv-api 本地源格式（频道名,直链）</li>
-            <li><code>douyu-report.csv</code> —— 全部房间的实测报告</li>
+            <li><code>douyu-report.csv</code> —— 全部房间的实测报告（含真实分辨率、是否转码）</li>
           </ul>
           HTMLEOF
 
