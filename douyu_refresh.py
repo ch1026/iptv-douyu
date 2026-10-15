@@ -18,6 +18,24 @@
   --local     可选，额外输出 iptv-api 本地源/白名单格式（频道名,直链）
   --report    可选，输出完整扫描报告 CSV
   --min-width 最小宽度门槛，默认 1920（低于此值的房间会被剔除）
+  --extra-rooms  额外收录的房间（源 m3u 里没有的），格式：
+                 "5908256=蓝翔新三国,7459925=蓝翔老三国" 或 "5908256,7459925"
+                 额外房间不受 --min-width 限制（它本来就是为了把被主仓库过滤掉的
+                 低画质房间捞回来），会在报告里标成「额外收录」。
+  --extra-rooms-file  从文件读额外房间，一行一个：房间号[=频道名]
+  --keep-upstream  合并版里，斗鱼线路换原画直链的同时【保留】上游转流线作为备用。
+                 默认开启。上游转流线（live.ottiptv.cc/douyu/xxxx）虽然只有 720P，
+                 但它可以重复请求 —— 斗鱼原画直链是「一次性授权」（见下方说明），
+                 播放器若先测速再播放，原画线会被测速用掉而播放失败，此时上游线可兜底。
+                 用 --no-keep-upstream 关闭。
+  --cookie    可选，斗鱼登录 Cookie。带上后多档位房间有机会拿到 rate=0 的真原画
+              （不带 Cookie 时斗鱼会把多档位房间降级成 _4000 / _550 转码流）。
+  --worker-base  可选。填入你部署好的中转服务地址，例如
+                 https://douyu-xxx.yyy.workers.dev
+                 填了之后，输出的线路地址会变成 "${worker-base}/d/<房间号>"，
+                 由中转服务在每次请求时【重新签发】一条新直链并 302 过去。
+                 这是目前唯一能彻底解决「直链一次性、播放器测速后播放失败」的方案，
+                 见同目录 douyu-worker.js 与说明文档。
   --no-verify 跳过真流校验。默认会抓 FLV 头实测分辨率，因为斗鱼档位名存在虚标
               （实测有标注 1080P、实际只推 720P 的房间）
   --referer   写入斗鱼线路的 Referer，默认 https://www.douyu.com/。
@@ -59,6 +77,10 @@ DOUYU_LINE = re.compile(r"live\.ottiptv\.cc/douyu/(\d+)")
 HOST_BAD = re.compile(r"edgesrv", re.I)
 
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+# 全局可选 Cookie（仅 --cookie 时非空）。拉流探测也带上，避免登录态房间
+# 在「签发时是原画、拉流时被判未登录」的情况下误判。
+_COOKIE = ""
 
 
 def md5(s: str) -> str:
@@ -104,6 +126,8 @@ def stream_bytes(url: str, referer=None, secs: float = 2.5,
     h = {"User-Agent": ua}
     if referer:
         h["Referer"] = referer
+    if _COOKIE:
+        h["Cookie"] = _COOKIE
     try:
         resp = http(url, headers=h, timeout=12)
     except Exception:  # noqa: BLE001
@@ -156,6 +180,8 @@ def flv_resolution(url: str, timeout: int = 20, referer=None):
     h = {"User-Agent": "Lavf/58.76.100"}
     if referer:
         h["Referer"] = referer
+    if _COOKIE:
+        h["Cookie"] = _COOKIE
     try:
         resp = http(url, headers=h, timeout=timeout)
         data = resp.read(260000)
@@ -183,10 +209,16 @@ class Douyu:
     KEY_URL = "https://www.douyu.com/wgapi/livenc/liveweb/websec/getEncryption?did=" + DID
     PLAY_URL = "https://www.douyu.com/lapi/live/getH5PlayV1/%s"
 
-    def __init__(self, cdn: str = "hw-h5"):
+    def __init__(self, cdn: str = "hw-h5", cookie: str = ""):
         self.cdn = cdn
+        self.cookie = (cookie or "").strip()
         self._kd = None
         self._lock = threading.Lock()
+
+    def _ck(self, h: dict) -> dict:
+        if self.cookie:
+            h["Cookie"] = self.cookie
+        return h
 
     def key(self, force: bool = False):
         with self._lock:
@@ -195,7 +227,9 @@ class Douyu:
             last = None
             for _ in range(4):
                 try:
-                    raw = http(self.KEY_URL, timeout=20).read().decode("utf-8", "ignore")
+                    raw = http(self.KEY_URL, timeout=20,
+                               headers=self._ck({"Referer": "https://www.douyu.com/"})
+                               ).read().decode("utf-8", "ignore")
                     j = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
                     if j.get("error") == 0 and j.get("data"):
                         self._kd = j["data"]
@@ -232,8 +266,9 @@ class Douyu:
                 ).encode()
                 raw = http(
                     self.PLAY_URL % rid, data=body,
-                    headers={"Content-Type": "application/x-www-form-urlencoded",
-                             "Referer": "https://www.douyu.com/%s" % rid},
+                    headers=self._ck({
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Referer": "https://www.douyu.com/%s" % rid}),
                     timeout=20,
                 ).read().decode("utf-8", "ignore")
                 j = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
@@ -244,13 +279,22 @@ class Douyu:
                         continue
                     return last
                 d = j.get("data") or {}
-                url = (d.get("rtmp_url") or "").rstrip("/") + "/" + (d.get("rtmp_live") or "")
+                live = d.get("rtmp_live") or ""
+                url = (d.get("rtmp_url") or "").rstrip("/") + "/" + live
                 mr = d.get("multirates") or []
                 rate_name = (mr[0].get("name") if mr else "") or ""
                 bit = (mr[0].get("bit") if mr else 0) or 0
                 w, h = parse_resolution(rate_name)
+                # 斗鱼对多档位房间 + 未登录请求会降级成转码流，流名形如
+                # `9999rMfVyoBTjV0x_4000.flv`（_4000 = 4000kbps 转码）。
+                # 无 `_NNN` 后缀才是主播真实推流的原画。实测 24 个热门房间：
+                # 多档位房间 17/17 被降级，单/双档位房间 7/7 拿到真原画。
+                tc = re.search(r"_(\d+)\.flv$", live.split("?")[0])
                 return {"error": 0, "msg": "", "url": url, "rate_name": rate_name,
-                        "bit": bit, "width": w, "height": h}
+                        "bit": bit, "width": w, "height": h,
+                        "stream": live.split("?")[0],
+                        "transcoded": bool(tc),
+                        "transcoded_bit": int(tc.group(1)) if tc else 0}
             except Exception as e:  # noqa: BLE001
                 last = {"error": "EXC", "msg": str(e)[:90]}
                 if attempt < retry:
@@ -300,21 +344,65 @@ def main():
     ap.add_argument("--no-referer", action="store_true",
                     help="不写入 Referer 指令（仅在播放器不识别该指令时才需要）")
     ap.add_argument("--min-width", type=int, default=1920, help="最小宽度，默认 1920")
+    ap.add_argument("--extra-rooms", default="",
+                    help='额外收录的房间（源里没有的），如 "5908256=蓝翔新三国,7459925=蓝翔老三国"')
+    ap.add_argument("--extra-rooms-file", default=None,
+                    help="从文件读额外房间，一行一个：房间号[=频道名]")
+    ap.add_argument("--keep-upstream", dest="keep_upstream", action="store_true", default=True,
+                    help="合并版保留上游转流线作为备用（默认开启）")
+    ap.add_argument("--no-keep-upstream", dest="keep_upstream", action="store_false",
+                    help="合并版不保留上游转流线")
+    ap.add_argument("--cookie", default="",
+                    help="斗鱼登录 Cookie，带上后多档位房间有机会拿到 rate=0 真原画")
+    ap.add_argument("--worker-base", default="",
+                    help="中转服务地址，填了则输出 ${worker-base}/d/<房间号>，"
+                         "由中转服务每次请求重新签发直链（推荐，见 douyu-worker.js）")
     ap.add_argument("--cdn", default="hw-h5", help="斗鱼 CDN 参数，默认 hw-h5")
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 个房间（调试用）")
-    ap.add_argument("--workers", type=int, default=4,
-                    help="并发数，默认 4。斗鱼对高频请求会概率性返回空流"
-                         "（实测 6 并发时出数据率约 76%，降到 4 并加重试后更稳），"
+    ap.add_argument("--workers", type=int, default=3,
+                    help="并发数，默认 3。斗鱼对高频请求会概率性返回空流"
+                         "（实测 6 并发时出数据率约 76%%，降到 4 并加重试后更稳），"
                          "调高会更快但更容易被限流误伤")
     ap.add_argument("--min-success-ratio", type=float, default=0.3,
                     help="最低成功率，低于则退出码 2 且不写文件")
     args = ap.parse_args()
 
+    global _COOKIE
+    _COOKIE = (args.cookie or "").strip()
+    wbase = args.worker_base.rstrip("/")
+
     t0 = time.time()
     print("源      :", args.src)
     lines = read_source(args.src)
     rooms = collect_rooms(lines)
-    print("斗鱼房间:", len(rooms), "个")
+    n_src = len(rooms)
+
+    # 额外房间：主仓库因为画质门槛过滤掉的房间，在这里手动捞回来
+    extra_specs = []
+    if args.extra_rooms:
+        extra_specs += [s.strip() for s in args.extra_rooms.split(",") if s.strip()]
+    if args.extra_rooms_file and os.path.exists(args.extra_rooms_file):
+        with open(args.extra_rooms_file, encoding="utf-8", errors="ignore") as f:
+            for ln in f:
+                ln = ln.split("#")[0].strip()
+                if ln:
+                    extra_specs.append(ln)
+
+    have = {r["rid"] for r in rooms}
+    n_extra = 0
+    for spec in extra_specs:
+        if "=" in spec:
+            rid, nm = spec.split("=", 1)
+        else:
+            rid, nm = spec, spec
+        rid, nm = rid.strip(), nm.strip()
+        if not rid.isdigit() or rid in have:
+            continue
+        have.add(rid)
+        rooms.append({"rid": rid, "name": nm, "extinf": None, "extra": True})
+        n_extra += 1
+
+    print("斗鱼房间: %d 个（源 %d + 额外 %d）" % (len(rooms), n_src, n_extra))
     if not rooms:
         print("!! 源里没有斗鱼线路，终止（不覆盖已有文件）")
         return 2
@@ -325,10 +413,12 @@ def main():
             rids.append(r["rid"])
     if args.limit:
         rids = rids[:args.limit]
-    print("去重房间:", len(rids), "个 | CDN:", args.cdn, "| 并发:", args.workers)
+    print("去重房间:", len(rids), "个 | CDN:", args.cdn, "| 并发:", args.workers,
+          "| Cookie:", "已提供" if _COOKIE else "无",
+          "| 中转:", wbase if args.worker_base else "无")
     print("-" * 78)
 
-    dy = Douyu(cdn=args.cdn)
+    dy = Douyu(cdn=args.cdn, cookie=_COOKIE)
     # 先取一次密钥，避免 200 个线程同时抢
     try:
         dy.key()
@@ -354,6 +444,14 @@ def main():
         for rid, r in ex.map(work, rids):
             results[rid] = r
 
+    extra_rids = {r["rid"] for r in rooms if r.get("extra")}
+
+    def floor_of(rid):
+        """额外房间本就是为了捞回被主仓库按画质过滤掉的频道，所以不设门槛"""
+        if rid in extra_rids:
+            return 0
+        return args.min_width
+
     ok, low, fail = [], [], []
     for rid in rids:
         r = results[rid]
@@ -361,7 +459,7 @@ def main():
             fail.append((rid, r))
         elif HOST_BAD.search(r.get("url", "")):
             fail.append((rid, {"error": "BADHOST", "msg": "被调度到 edgesrv 边缘节点"}))
-        elif r.get("width", 0) < args.min_width:
+        elif r.get("width", 0) < floor_of(rid):
             low.append((rid, r))
         else:
             ok.append((rid, r))
@@ -372,7 +470,10 @@ def main():
     ref_url = None if args.no_referer else (args.referer or None)
     if ref_url and ok:
         print("Referer 探测: %s" % probe_referer([r["url"] for _, r in ok][:5]))
-        print("  -> 将为每条斗鱼线路写入 #EXTVLCOPT:http-referrer=%s" % ref_url)
+        if args.worker_base:
+            print("  -> 走中转服务，Referer 由中转服务补，m3u 里不再写 #EXTVLCOPT")
+        else:
+            print("  -> 将为每条斗鱼线路写入 #EXTVLCOPT:http-referrer=%s" % ref_url)
 
     # 实测校验：斗鱼档位名存在虚标（实测有标注 1080P 但只推 720P 的房间），
     # 只信档位名会把低清源混进结果，所以抓一次真流确认。
@@ -392,7 +493,7 @@ def main():
         verified, false_label = [], 0
         with cf.ThreadPoolExecutor(max_workers=args.workers) as ex:
             for (rid, r), (w, h, bit) in zip(ok, ex.map(check_one, ok)):
-                if w and w < args.min_width:
+                if w and w < floor_of(rid):
                     false_label += 1
                     bad = dict(r)
                     bad["verified"] = "档位名 %s 虚标，实测 %dx%d" % (
@@ -423,17 +524,33 @@ def main():
     # 所以这里显式 +8 小时换算成北京时间再写进注释，避免时间戳误导。
     stamp = time.strftime("%Y-%m-%d %H:%M:%S",
                           time.gmtime(time.time() + 8 * 3600)) + " (UTC+8)"
-    hdr = "#EXTVLCOPT:http-referrer=%s" % ref_url if ref_url else None
+    use_worker = bool(args.worker_base)
+
+    def out_url(rid, r):
+        """最终写进 m3u 的线路地址。填了 --worker-base 就指向中转服务，
+        由它每次重新签发新直链 —— 这是绕开「直链一次性」的唯一办法。"""
+        return "%s/d/%s" % (wbase, rid) if use_worker else r["url"]
+
+    # 走中转服务时，播放器只跟中转服务打交道，Referer 由中转服务自己补，
+    # 所以不必再往 m3u 里写 #EXTVLCOPT:http-referrer。
+    hdr = "#EXTVLCOPT:http-referrer=%s" % ref_url if (ref_url and not use_worker) else None
+
     out = ["#EXTM3U x-tvg-url=\"https://ch1026.github.io/iptv-api/epg.xml\"",
-           "# 生成时间: %s | 斗鱼直链有效期约 20~30 分钟，靠定时重跑保持新鲜" % stamp]
+           "# 生成时间: %s" % stamp]
+    if use_worker:
+        out.append("# 线路由中转服务 %s 动态签发直链（每次请求都是新的 token）" % wbase)
+    else:
+        out.append("# ⚠️ 直链为「一次性授权」：同一地址只能成功拉流一次，"
+                   "播放器若先测速再播放、或播放中断线重连，都会失败。")
+        out.append("#    彻底解决请部署中转服务（见 douyu-worker.js），"
+                   "并给本脚本加 --worker-base <你的服务地址>。")
     if hdr:
         out.append("# 斗鱼线路需要 Referer，已在每条线路前写入 %s" % hdr)
     local = ["# iptv-api 本地源 / 白名单格式：频道名,直链",
-             "# 直链约 20~30 分钟过期，需由定时任务重新生成"]
-    if ref_url:
-        local.append("# ⚠️ 本批链接位于需要 Referer 的 CDN，而本格式无法携带请求头，"
-                     "建议优先使用 m3u 输出")
-    report = [("频道名", "房间号", "状态", "规格", "宽度", "高度", "码率kbps", "直链")]
+             "# ⚠️ 斗鱼直链为一次性授权且需要 Referer 请求头，本格式无法携带请求头，"
+             "建议优先使用 m3u 输出或中转服务"]
+    report = [("频道名", "房间号", "状态", "档位名", "流类型", "宽度", "高度",
+               "码率kbps", "实测", "直链")]
     written = set()
     seen_local = set()
     good_map = {rid: r for rid, r in ok}
@@ -446,17 +563,25 @@ def main():
         if not r:
             src = results.get(rid) or {}
             reason = src.get("verified") or src.get("rate_name") or str(src.get("error") or "未取流")
-            report.append((name, rid, "剔除", reason, 0, 0, 0, ""))
+            report.append((name, rid, "额外-剔除" if room.get("extra") else "剔除",
+                           reason, "", 0, 0, 0, "", ""))
             continue
-        out.append(room["extinf"] or "#EXTINF:-1,%s" % name)
+        if room["extinf"]:
+            out.append(room["extinf"])
+        else:
+            out.append("#EXTINF:-1 group-title=\"斗鱼补充\",%s" % name)
         if hdr:
             out.append(hdr)
-        out.append(r["url"])
+        out.append(out_url(rid, r))
         written.add(rid)
-        report.append((name, rid, "OK", r["rate_name"], r["width"], r["height"], r["bit"], r["url"]))
+        kind = ("转码%sk" % r["transcoded_bit"]) if r.get("transcoded") else "原画"
+        report.append((name, rid,
+                       "额外OK" if room.get("extra") else "OK",
+                       r["rate_name"], kind, r["width"], r["height"], r["bit"],
+                       r.get("verified", ""), out_url(rid, r)))
         if name not in seen_local:
             seen_local.add(name)
-            local.append("%s,%s" % (name, r["url"]))
+            local.append("%s,%s" % (name, out_url(rid, r)))
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
@@ -481,6 +606,9 @@ def main():
             if ln.startswith("#EXTM3U") and not noted:
                 merged.append(ln)
                 merged.append("# 斗鱼线路已替换为官方原画直链 | 生成时间: %s" % stamp)
+                merged.append("# 注意：斗鱼直链是「一次性授权」——同一地址只能成功拉流一次。")
+                merged.append("#      播放器先测速再播放、或播放中重连，都会失败。"
+                              "要彻底解决请用 --worker-base 中转。")
                 if hdr:
                     merged.append("# 斗鱼线路需要 Referer，已在每条斗鱼线路前写入 %s" % hdr)
                 noted = True
@@ -489,14 +617,29 @@ def main():
             if not m:
                 merged.append(ln)
                 continue
-            r = good_map.get(m.group(1))
+            rid = m.group(1)
+            r = good_map.get(rid)
             # 取不到原画时保留原线路兜底，而不是直接删掉，避免频道消失
             if not r:
                 merged.append(ln)
                 continue
             if hdr:
                 merged.append(hdr)
-            merged.append(r["url"])
+            merged.append(out_url(rid, r))
+            # 保留上游转流线作为备用：它可重复请求，是唯一能扛住「播放器测速」的线路
+            if args.keep_upstream and not use_worker:
+                merged.append(ln)
+        # 额外房间（源里本来没有的）追加到末尾，自成一组「斗鱼补充」
+        extra_ok = [(r["rid"], r) for r in rooms
+                    if r.get("extra") and r["rid"] in good_map]
+        if extra_ok:
+            merged.append("# 以下为额外收录频道（主仓库因画质门槛过滤掉，此处手动加回）")
+            for rid, room in extra_ok:
+                r = good_map[rid]
+                merged.append("#EXTINF:-1 group-title=\"斗鱼补充\",%s" % room["name"])
+                if hdr:
+                    merged.append(hdr)
+                merged.append(out_url(rid, r))
         os.makedirs(os.path.dirname(os.path.abspath(args.merge)), exist_ok=True)
         with open(args.merge, "w", encoding="utf-8") as f:
             f.write("\n".join(merged) + "\n")
