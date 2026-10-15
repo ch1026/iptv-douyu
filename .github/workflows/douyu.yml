@@ -7,7 +7,11 @@
 # 一个仓库只能有一个 Pages 站点。如果在这个仓库里再加一条部署，两个工作流会互相
 # 覆盖整个站点，result.m3u 会时好时坏。
 #
-# 跑起来后订阅地址为：https://<你的用户名>.github.io/<本仓库名>/douyu.m3u
+# 跑起来后：
+#   完整合并版（**推荐直接用它替代主订阅**，斗鱼时效由本任务保证）：
+#     https://<你的用户名>.github.io/<本仓库名>/full.m3u
+#   仅斗鱼频道：
+#     https://<你的用户名>.github.io/<本仓库名>/douyu.m3u
 
 name: douyu-m3u
 
@@ -44,11 +48,16 @@ jobs:
 
       # 成功率低于 30% 时脚本返回退出码 2，本步骤失败 -> 后续步骤不执行 ->
       # 线上保留上一次的好结果，不会被空文件覆盖。
+      #
+      # --merge 产出【完整合并版】full.m3u：主结果里的非斗鱼线路原样保留、
+      # 斗鱼线路换成原画直链。它可以直接替代主订阅地址，这样斗鱼源的时效
+      # 由本任务（每 10 分钟）保证，主仓库无需做任何改动、也不用配白名单。
       - name: 生成斗鱼原画源
         run: |
           python douyu_refresh.py \
             --src "https://ch1026.github.io/iptv-api/result.m3u" \
             --out  public/douyu.m3u \
+            --merge public/full.m3u \
             --local public/douyu-local.txt \
             --report public/douyu-report.csv
 
@@ -58,13 +67,17 @@ jobs:
           <!doctype html><meta charset="utf-8">
           <title>斗鱼原画源</title>
           <style>body{font:15px/1.9 system-ui,sans-serif;max-width:760px;margin:40px auto;padding:0 20px}
-          code{background:#f4f4f4;padding:2px 6px;border-radius:4px}</style>
+          code{background:#f4f4f4;padding:2px 6px;border-radius:4px}h3{margin-bottom:4px}</style>
           <h2>斗鱼原画源</h2>
           <p>由 GitHub Actions 每 10 分钟自动刷新，直链带签名，约 20~30 分钟过期，请勿手动另存。</p>
+          <h3>推荐：完整合并版</h3>
+          <p><code>full.m3u</code> —— 主结果的全部频道 + 斗鱼线路已换成原画直链。
+          可直接替代原来的主订阅地址。</p>
+          <h3>其它文件</h3>
           <ul>
-            <li>播放器订阅：<code>douyu.m3u</code></li>
-            <li>iptv-api 本地源格式：<code>douyu-local.txt</code></li>
-            <li>扫描报告：<code>douyu-report.csv</code></li>
+            <li><code>douyu.m3u</code> —— 只含斗鱼频道，适合与原订阅并行使用</li>
+            <li><code>douyu-local.txt</code> —— iptv-api 本地源格式（频道名,直链）</li>
+            <li><code>douyu-report.csv</code> —— 全部房间的实测报告</li>
           </ul>
           HTMLEOF
 
