@@ -8,14 +8,18 @@
 
 用法：
   python douyu_refresh.py --src https://ch1026.github.io/iptv-api/result.m3u --out douyu.m3u
-  python douyu_refresh.py --src result.m3u --out douyu.m3u --local douyu-local.txt --report douyu-report.csv
+  python douyu_refresh.py --src result.m3u --out douyu.m3u --merge full.m3u --report r.csv
 
 参数：
   --src       源 m3u（本地路径或 http/https URL），默认取 iptv-api 结果地址
-  --out       输出的 m3u 文件
+  --out       输出的 m3u 文件（只含斗鱼，独立订阅用）
+  --merge     额外输出【完整合并版】m3u：源里非斗鱼线路原样保留、斗鱼线路换成原画直链。
+              这一版可直接当主订阅用，斗鱼新鲜度由本任务保证，无需依赖主仓库刷新频率。
   --local     可选，额外输出 iptv-api 本地源/白名单格式（频道名,直链）
   --report    可选，输出完整扫描报告 CSV
   --min-width 最小宽度门槛，默认 1920（低于此值的房间会被剔除）
+  --no-verify 跳过真流校验。默认会抓 FLV 头实测分辨率，因为斗鱼档位名存在虚标
+              （实测有标注 1080P、实际只推 720P 的房间）
   --cdn       斗鱼 CDN 参数，默认 hw-h5（必须显式指定，否则移动网络下会被调度到
               edgesrv.com:8443 边缘节点，导致 TLS 握手失败）
   --limit     只处理前 N 个房间（调试用）
@@ -34,6 +38,7 @@ import hashlib
 import json
 import os
 import re
+import struct
 import sys
 import threading
 import time
@@ -82,6 +87,33 @@ def parse_resolution(name: str):
     if "1080" in name:
         return 1920, 1080
     return 0, 0
+
+
+def flv_resolution(url: str, timeout: int = 20):
+    """实抓 FLV 流的 onMetaData，返回真实 (宽, 高, 视频码率kbps)。
+
+    必要性：斗鱼返回的档位名存在虚标（实测有标注 1080P、实际只推 720P 的房间），
+    只信档位名会把低清源混进结果，所以这里做一次真流校验。
+    """
+    try:
+        resp = http(url, headers={"User-Agent": "Lavf/58.76.100"}, timeout=timeout)
+        data = resp.read(260000)
+    except Exception:  # noqa: BLE001
+        return 0, 0, 0
+
+    def num_after(tag: bytes):
+        i = data.find(tag)
+        while i >= 0:
+            j = i + len(tag)
+            if data[j:j + 1] == b"\x00" and j + 9 <= len(data):
+                return struct.unpack(">d", data[j + 1:j + 9])[0]
+            i = data.find(tag, i + 1)
+        return None
+
+    w = num_after(b"width")
+    h = num_after(b"height")
+    vk = num_after(b"videodatarate")
+    return (int(w) if w else 0, int(h) if h else 0, int(vk) if vk else 0)
 
 
 class Douyu:
@@ -194,6 +226,11 @@ def main():
     ap.add_argument("--out", default="douyu.m3u", help="输出的 m3u 文件")
     ap.add_argument("--local", default=None, help="额外输出 iptv-api 本地源格式（频道名,直链）")
     ap.add_argument("--report", default=None, help="输出完整扫描报告 CSV")
+    ap.add_argument("--merge", default=None,
+                    help="输出【完整合并版】m3u：源里的非斗鱼线路原样保留，"
+                         "斗鱼线路替换为原画直链。用于替代主订阅，避免依赖主仓库刷新频率。")
+    ap.add_argument("--no-verify", action="store_true",
+                    help="跳过实际分辨率校验（默认会抓 FLV 头实测，防止斗鱼档位名虚标）")
     ap.add_argument("--min-width", type=int, default=1920, help="最小宽度，默认 1920")
     ap.add_argument("--cdn", default="hw-h5", help="斗鱼 CDN 参数，默认 hw-h5")
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 个房间（调试用）")
@@ -258,6 +295,27 @@ def main():
         else:
             ok.append((rid, r))
 
+    # 实测校验：斗鱼档位名存在虚标（实测有标注 1080P 但只推 720P 的房间），
+    # 只信档位名会把低清源混进结果，所以抓一次真流确认。
+    if ok and not args.no_verify:
+        print("实测校验: %d 条（读 FLV 头确认真实分辨率）" % len(ok))
+        verified, false_label = [], 0
+        with cf.ThreadPoolExecutor(max_workers=args.workers) as ex:
+            for (rid, r), (w, h, bit) in zip(ok, ex.map(
+                    lambda x: flv_resolution(x[1]["url"]), ok)):
+                if w and w < args.min_width:
+                    false_label += 1
+                    bad = dict(r)
+                    bad["verified"] = "档位名 %s 虚标，实测 %dx%d" % (
+                        r.get("rate_name") or "?", w, h)
+                    low.append((rid, bad))
+                else:
+                    good = dict(r)
+                    good["verified"] = ("实测 %dx%d %dkbps" % (w, h, bit)) if w else "未校验成功（探测超时）"
+                    verified.append((rid, good))
+        ok = verified
+        print("  校验后达标: %d 条 | 拦截虚标: %d 条" % (len(ok), false_label))
+
     print("-" * 78)
     print("原画达标 : %d" % len(ok))
     print("低于门槛 : %d" % len(low))
@@ -272,22 +330,25 @@ def main():
         return 2
 
     # 组装输出：沿用原始 #EXTINF，保证分组/台标与主订阅一致
-    out = ["#EXTM3U x-tvg-url=\"https://ch1026.github.io/iptv-api/epg.xml\""]
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    out = ["#EXTM3U x-tvg-url=\"https://ch1026.github.io/iptv-api/epg.xml\"",
+           "# 生成时间: %s (UTC+8) | 斗鱼直链有效期约 20~30 分钟，靠定时重跑保持新鲜" % stamp]
     local = ["# iptv-api 本地源 / 白名单格式：频道名,直链",
              "# 直链约 20~30 分钟过期，需由定时任务重新生成"]
     report = [("频道名", "房间号", "状态", "规格", "宽度", "高度", "码率kbps", "直链")]
     written = set()
     seen_local = set()
+    good_map = {rid: r for rid, r in ok}
 
     for room in rooms:
         rid, name = room["rid"], room["name"]
         if args.limit and rid not in results:
             continue
-        r = results.get(rid)
-        if not r or r.get("error") or HOST_BAD.search(r.get("url", "")) \
-                or r.get("width", 0) < args.min_width:
-            report.append((name, rid, "剔除", (r or {}).get("rate_name", "") or str((r or {}).get("error")),
-                           0, 0, 0, ""))
+        r = good_map.get(rid)
+        if not r:
+            src = results.get(rid) or {}
+            reason = src.get("verified") or src.get("rate_name") or str(src.get("error") or "未取流")
+            report.append((name, rid, "剔除", reason, 0, 0, 0, ""))
             continue
         out.append(room["extinf"] or "#EXTINF:-1,%s" % name)
         out.append(r["url"])
@@ -310,6 +371,29 @@ def main():
         with open(args.report, "w", encoding="utf-8-sig", newline="") as f:
             csv.writer(f).writerows(report)
         print("已写出   :", args.report)
+
+    # 完整合并版：源 m3u 里的非斗鱼线路原样保留，斗鱼线路替换为原画直链。
+    # 用途：直接替代主订阅地址，这样斗鱼源的新鲜度由本任务（每 10 分钟）保证，
+    # 不受主仓库 12 小时刷新频率的限制，也无需碰主仓库的白名单配置。
+    if args.merge:
+        merged, noted = [], False
+        for ln in lines:
+            if ln.startswith("#EXTM3U") and not noted:
+                merged.append(ln)
+                merged.append("# 斗鱼线路已替换为官方原画直链 | 生成时间: %s (UTC+8)" % stamp)
+                noted = True
+                continue
+            m = DOUYU_LINE.search(ln)
+            if not m:
+                merged.append(ln)
+                continue
+            r = good_map.get(m.group(1))
+            # 取不到原画时保留原线路兜底，而不是直接删掉，避免频道消失
+            merged.append(r["url"] if r else ln)
+        os.makedirs(os.path.dirname(os.path.abspath(args.merge)), exist_ok=True)
+        with open(args.merge, "w", encoding="utf-8") as f:
+            f.write("\n".join(merged) + "\n")
+        print("已写出   :", args.merge, "(完整合并版，共 %d 行)" % len(merged))
 
     print("耗时     : %.1fs" % (time.time() - t0))
     return 0
