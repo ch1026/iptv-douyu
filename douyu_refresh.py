@@ -520,7 +520,8 @@ def main():
     if ref_url and ok:
         print("Referer 探测: %s" % probe_referer([r["url"] for _, r in ok][:5]))
         if args.worker_base:
-            print("  -> 走中转服务，Referer 由中转服务补，m3u 里不再写 #EXTVLCOPT")
+            print("  -> 走中转服务：/r/ 由服务端补 Referer，/d/ 依赖播放器发 Referer，"
+                  "因此 m3u 里仍然写入 #EXTVLCOPT:http-referrer=%s" % ref_url)
         else:
             print("  -> 将为每条斗鱼线路写入 #EXTVLCOPT:http-referrer=%s" % ref_url)
 
@@ -580,6 +581,52 @@ def main():
                 if len(soft) > 6:
                     print("       ... 另有 %d 条" % (len(soft) - 6))
 
+    # ★★★ 关键修复（2026-10-16）★★★
+    # 直链是「一次性授权」：同一条 URL 的第二次连接会被 CDN 在读到
+    # 0.3~2MB 时掐断。而上面的画质校验（check_one）已经把每条 r["url"]
+    # 都打开过一次 —— 如果把这条「二手链接」写给播放器，它的播放就是
+    # 第二次连接，表现正是「播两秒就失败」，且所有频道无一幸免。
+    # 所以这里为每条达标线路【重新签发】一条全新直链用于输出；
+    # 校验用的那条就让它就地消耗。中转模式下输出的是 /d/、/r/ 地址
+    # （每次请求实时签发），不存在这个问题，无需重签。
+    if ok and not args.worker_base:
+        print("重新签发: %d 条（校验消耗的是一次性授权，输出必须用全新直链）" % len(ok))
+
+        def resign_one(item):
+            _rid, _r = item
+            for attempt in range(3):
+                try:
+                    nr = dy.play(_rid)
+                    if not nr.get("error") and nr.get("url") \
+                            and not HOST_BAD.search(nr["url"]):
+                        return nr
+                except Exception:  # noqa: BLE001
+                    pass
+                time.sleep(1.0)
+            return None
+
+        fresh, failed_resign = [], 0
+        with cf.ThreadPoolExecutor(max_workers=args.workers) as ex:
+            for (rid, r), nr in zip(ok, ex.map(resign_one, ok)):
+                if nr is None:
+                    # 重签失败只能写旧链接 —— 大概率播不出，但聊胜于无
+                    failed_resign += 1
+                    fresh.append((rid, r))
+                    continue
+                g = dict(r)
+                g["url"] = nr["url"]
+                # 以新签发返回的档位/码率为准（同一房间通常一致）
+                if nr.get("rate_name"):
+                    g["rate_name"] = nr["rate_name"]
+                if nr.get("bit"):
+                    g["bit"] = nr["bit"]
+                if nr.get("width"):
+                    g["width"], g["height"] = nr.get("width"), nr.get("height")
+                fresh.append((rid, g))
+        ok = fresh
+        if failed_resign:
+            print("  ⚠️ %d 条重签失败，仍写旧链接（可能播不出）" % failed_resign)
+
     print("-" * 78)
     print("原画达标 : %d" % len(ok))
     print("低于门槛 : %d" % len(low))
@@ -614,9 +661,13 @@ def main():
         mode = "r" if rid in relay_set else "d"
         return "%s/%s/%s" % (wbase, mode, rid)
 
-    # 走中转服务时，播放器只跟中转服务打交道，Referer 由中转服务自己补，
-    # 所以不必再往 m3u 里写 #EXTVLCOPT:http-referrer。
-    hdr = "#EXTVLCOPT:http-referrer=%s" % ref_url if (ref_url and not use_worker) else None
+    # Referer 指令是【两种模式都要写】的：
+    #   - 直链模式：斗鱼境外 CDN（ws3）不带 Referer 会「连上但立刻 EOF」；
+    #   - 中转模式：/r/ 中继由服务端自己补 Referer，播放器带不带都行（带了无害），
+    #     但 /d/ 是 302 —— 播放器【直接】去连斗鱼 CDN，
+    #     而中转服务多半在境外、签发的必然是 ws3 族地址，这就需要播放器自己发 Referer。
+    # 早期版本在 worker 模式下省掉了这行，属于 bug，已修。
+    hdr = "#EXTVLCOPT:http-referrer=%s" % ref_url if ref_url else None
 
     out = ["#EXTM3U x-tvg-url=\"https://ch1026.github.io/iptv-api/epg.xml\"",
            "# 生成时间: %s" % stamp]
