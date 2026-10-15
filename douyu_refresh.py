@@ -20,6 +20,11 @@
   --min-width 最小宽度门槛，默认 1920（低于此值的房间会被剔除）
   --no-verify 跳过真流校验。默认会抓 FLV 头实测分辨率，因为斗鱼档位名存在虚标
               （实测有标注 1080P、实际只推 720P 的房间）
+  --referer   写入斗鱼线路的 Referer，默认 https://www.douyu.com/。
+              必须保留：斗鱼部分 CDN（境外 IP 签发时被调度到的 ws3.douyucdn.cn）
+              不带 Referer 时返回 HTTP 200 但空流 —— 实测 20 条里只有 2 条能出数据，
+              带上 Referer 后 20/20 全部正常。播放器表现就是"频道加载出来但黑屏"。
+  --no-referer 不写 Referer 指令（仅当播放器不识别该指令时才用）
   --cdn       斗鱼 CDN 参数，默认 hw-h5（必须显式指定，否则移动网络下会被调度到
               edgesrv.com:8443 边缘节点，导致 TLS 握手失败）
   --limit     只处理前 N 个房间（调试用）
@@ -89,14 +94,70 @@ def parse_resolution(name: str):
     return 0, 0
 
 
-def flv_resolution(url: str, timeout: int = 20):
+def stream_bytes(url: str, referer=None, secs: float = 2.5,
+                 ua: str = "Lavf/58.76.100") -> int:
+    """连接后持续读取 secs 秒，返回实际读到的字节数（0 = 空流/失败）。
+
+    用来区分「HTTP 200 但无数据」与「真的能出流」——斗鱼部分 CDN 对无 Referer 的
+    请求会返回 200 + video/x-flv 但立刻 EOF，播放器表现就是"连上了播不出来"。
+    """
+    h = {"User-Agent": ua}
+    if referer:
+        h["Referer"] = referer
+    try:
+        resp = http(url, headers=h, timeout=12)
+    except Exception:  # noqa: BLE001
+        return 0
+    t0 = time.time()
+    n = 0
+    try:
+        while time.time() - t0 < secs:
+            c = resp.read(65536)
+            if not c:
+                break
+            n += len(c)
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        try:
+            resp.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return n
+
+
+def probe_referer(urls, tries: int = 5) -> str:
+    """抽样统计「带 / 不带 Referer」的出数据率，仅用于日志说明。
+
+    实测数据（20 条串行，ws3.douyucdn.cn）：
+        无 Referer  2/20 (10%)   ← 抽到个别特殊流时误判，样本必须够大
+        带 Referer 20/20 (100%)
+    而不需要 Referer 的 hw3.douyucdn2.cn 带上同样正常，所以策略是**总是附带**，
+    不靠探测结果决定是否加头。
+    """
+    n = min(tries, len(urls))
+    if n == 0:
+        return "无样本"
+    no_ok = yes_ok = 0
+    for u in urls[:n]:
+        if stream_bytes(u, None, 2.0) > 0:
+            no_ok += 1
+        if stream_bytes(u, "https://www.douyu.com/", 2.0) > 0:
+            yes_ok += 1
+    return "无 Referer %d/%d 出数据，带 Referer %d/%d 出数据" % (no_ok, n, yes_ok, n)
+
+
+def flv_resolution(url: str, timeout: int = 20, referer=None):
     """实抓 FLV 流的 onMetaData，返回真实 (宽, 高, 视频码率kbps)。
 
     必要性：斗鱼返回的档位名存在虚标（实测有标注 1080P、实际只推 720P 的房间），
     只信档位名会把低清源混进结果，所以这里做一次真流校验。
     """
+    h = {"User-Agent": "Lavf/58.76.100"}
+    if referer:
+        h["Referer"] = referer
     try:
-        resp = http(url, headers={"User-Agent": "Lavf/58.76.100"}, timeout=timeout)
+        resp = http(url, headers=h, timeout=timeout)
         data = resp.read(260000)
     except Exception:  # noqa: BLE001
         return 0, 0, 0
@@ -231,10 +292,20 @@ def main():
                          "斗鱼线路替换为原画直链。用于替代主订阅，避免依赖主仓库刷新频率。")
     ap.add_argument("--no-verify", action="store_true",
                     help="跳过实际分辨率校验（默认会抓 FLV 头实测，防止斗鱼档位名虚标）")
+    ap.add_argument("--referer", default="https://www.douyu.com/",
+                    help="写入斗鱼线路的 Referer，默认 https://www.douyu.com/。"
+                         "斗鱼部分 CDN（如 ws3，境外 IP 签发时常被调度到此）不带 Referer 时"
+                         "会返回 HTTP 200 + video/x-flv 但立即 EOF，播放器表现为"
+                         "「频道加载出来却一直黑屏播不出」")
+    ap.add_argument("--no-referer", action="store_true",
+                    help="不写入 Referer 指令（仅在播放器不识别该指令时才需要）")
     ap.add_argument("--min-width", type=int, default=1920, help="最小宽度，默认 1920")
     ap.add_argument("--cdn", default="hw-h5", help="斗鱼 CDN 参数，默认 hw-h5")
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 个房间（调试用）")
-    ap.add_argument("--workers", type=int, default=6, help="并发数，默认 6")
+    ap.add_argument("--workers", type=int, default=4,
+                    help="并发数，默认 4。斗鱼对高频请求会概率性返回空流"
+                         "（实测 6 并发时出数据率约 76%，降到 4 并加重试后更稳），"
+                         "调高会更快但更容易被限流误伤")
     ap.add_argument("--min-success-ratio", type=float, default=0.3,
                     help="最低成功率，低于则退出码 2 且不写文件")
     args = ap.parse_args()
@@ -295,14 +366,32 @@ def main():
         else:
             ok.append((rid, r))
 
+    # 斗鱼部分 CDN 需要 Referer 才出流（详见 stream_bytes / probe_referer 注释）。
+    # 实测「带 Referer」在两种 CDN 上都是 100% 出数据，所以策略是默认总是附加，
+    # 而不是靠探测决定——探测样本小的时候会误判。
+    ref_url = None if args.no_referer else (args.referer or None)
+    if ref_url and ok:
+        print("Referer 探测: %s" % probe_referer([r["url"] for _, r in ok][:5]))
+        print("  -> 将为每条斗鱼线路写入 #EXTVLCOPT:http-referrer=%s" % ref_url)
+
     # 实测校验：斗鱼档位名存在虚标（实测有标注 1080P 但只推 720P 的房间），
     # 只信档位名会把低清源混进结果，所以抓一次真流确认。
     if ok and not args.no_verify:
         print("实测校验: %d 条（读 FLV 头确认真实分辨率）" % len(ok))
+
+        def check_one(item):
+            # 斗鱼对高频请求会概率性返回空流（实测：6 并发出数据的约占 76%，
+            # 低频请求为 100%），所以探测失败时降速重试一次，避免误判。
+            _rid, r = item
+            w, h, bit = flv_resolution(r["url"], referer=ref_url)
+            if not w:
+                time.sleep(1.2)
+                w, h, bit = flv_resolution(r["url"], referer=ref_url)
+            return w, h, bit
+
         verified, false_label = [], 0
         with cf.ThreadPoolExecutor(max_workers=args.workers) as ex:
-            for (rid, r), (w, h, bit) in zip(ok, ex.map(
-                    lambda x: flv_resolution(x[1]["url"]), ok)):
+            for (rid, r), (w, h, bit) in zip(ok, ex.map(check_one, ok)):
                 if w and w < args.min_width:
                     false_label += 1
                     bad = dict(r)
@@ -330,11 +419,20 @@ def main():
         return 2
 
     # 组装输出：沿用原始 #EXTINF，保证分组/台标与主订阅一致
-    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    # 注意 Actions runner 是 UTC 时区，localtime() 会得到 UTC，
+    # 所以这里显式 +8 小时换算成北京时间再写进注释，避免时间戳误导。
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S",
+                          time.gmtime(time.time() + 8 * 3600)) + " (UTC+8)"
+    hdr = "#EXTVLCOPT:http-referrer=%s" % ref_url if ref_url else None
     out = ["#EXTM3U x-tvg-url=\"https://ch1026.github.io/iptv-api/epg.xml\"",
-           "# 生成时间: %s (UTC+8) | 斗鱼直链有效期约 20~30 分钟，靠定时重跑保持新鲜" % stamp]
+           "# 生成时间: %s | 斗鱼直链有效期约 20~30 分钟，靠定时重跑保持新鲜" % stamp]
+    if hdr:
+        out.append("# 斗鱼线路需要 Referer，已在每条线路前写入 %s" % hdr)
     local = ["# iptv-api 本地源 / 白名单格式：频道名,直链",
              "# 直链约 20~30 分钟过期，需由定时任务重新生成"]
+    if ref_url:
+        local.append("# ⚠️ 本批链接位于需要 Referer 的 CDN，而本格式无法携带请求头，"
+                     "建议优先使用 m3u 输出")
     report = [("频道名", "房间号", "状态", "规格", "宽度", "高度", "码率kbps", "直链")]
     written = set()
     seen_local = set()
@@ -351,6 +449,8 @@ def main():
             report.append((name, rid, "剔除", reason, 0, 0, 0, ""))
             continue
         out.append(room["extinf"] or "#EXTINF:-1,%s" % name)
+        if hdr:
+            out.append(hdr)
         out.append(r["url"])
         written.add(rid)
         report.append((name, rid, "OK", r["rate_name"], r["width"], r["height"], r["bit"], r["url"]))
@@ -366,7 +466,7 @@ def main():
     if args.local:
         with open(args.local, "w", encoding="utf-8") as f:
             f.write("\n".join(local) + "\n")
-        print("已写出   :", args.local, "(%d 条)" % (len(local) - 2))
+        print("已写出   :", args.local, "(%d 条)" % len(seen_local))
     if args.report:
         with open(args.report, "w", encoding="utf-8-sig", newline="") as f:
             csv.writer(f).writerows(report)
@@ -380,7 +480,9 @@ def main():
         for ln in lines:
             if ln.startswith("#EXTM3U") and not noted:
                 merged.append(ln)
-                merged.append("# 斗鱼线路已替换为官方原画直链 | 生成时间: %s (UTC+8)" % stamp)
+                merged.append("# 斗鱼线路已替换为官方原画直链 | 生成时间: %s" % stamp)
+                if hdr:
+                    merged.append("# 斗鱼线路需要 Referer，已在每条斗鱼线路前写入 %s" % hdr)
                 noted = True
                 continue
             m = DOUYU_LINE.search(ln)
@@ -389,7 +491,12 @@ def main():
                 continue
             r = good_map.get(m.group(1))
             # 取不到原画时保留原线路兜底，而不是直接删掉，避免频道消失
-            merged.append(r["url"] if r else ln)
+            if not r:
+                merged.append(ln)
+                continue
+            if hdr:
+                merged.append(hdr)
+            merged.append(r["url"])
         os.makedirs(os.path.dirname(os.path.abspath(args.merge)), exist_ok=True)
         with open(args.merge, "w", encoding="utf-8") as f:
             f.write("\n".join(merged) + "\n")
